@@ -47,6 +47,9 @@ jobs:
       - name: Refinement framework suite
         run: python tests/test_refine.py
 
+      - name: Regression suite
+        run: python tests/test_regressions.py
+
       - name: Student enrollment example (gurobi_ml reproduction)
         env:
           KERAS_BACKEND: jax
