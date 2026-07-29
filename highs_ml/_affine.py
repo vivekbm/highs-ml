@@ -24,11 +24,25 @@ AffineLike = Union["Affine", highs_var, Number]
 class Affine:
     """A sparse affine form over highspy variables."""
 
-    __slots__ = ("terms", "const")
+    __slots__ = ("terms", "const", "model")
 
     def __init__(self, terms: Dict[highs_var, float] | None = None, const: float = 0.0):
         self.terms: Dict[highs_var, float] = dict(terms) if terms else {}
         self.const: float = float(const)
+        # highs_var hashes/compares by bare column index, so vars from
+        # different Highs models would silently collide as dict keys.
+        # Track the owning model (a weakref proxy; == is referent
+        # identity) and refuse mixed forms. Constant forms stay model-less.
+        model = None
+        for var in self.terms:
+            if model is None:
+                model = var.highs
+            elif var.highs != model:
+                raise ValueError(
+                    "Affine expression mixes variables from different HiGHS models; "
+                    "all variables in one expression must belong to the same model."
+                )
+        self.model = model
 
     # ------------------------------------------------------------------
     # construction / coercion
@@ -52,6 +66,17 @@ class Affine:
     # ------------------------------------------------------------------
     def __add__(self, other: AffineLike) -> "Affine":
         other = Affine.coerce(other)
+        # Must be checked before merging: same-index vars from different
+        # models would collapse into a single dict key, hiding the mix.
+        if (
+            self.model is not None
+            and other.model is not None
+            and self.model != other.model
+        ):
+            raise ValueError(
+                "Cannot combine affine expressions over variables from different "
+                "HiGHS models; all variables must belong to the same model."
+            )
         terms = dict(self.terms)
         for var, coef in other.terms.items():
             terms[var] = terms.get(var, 0.0) + coef
@@ -89,7 +114,7 @@ class Affine:
         col_bounds: list[tuple[float, float]] | None = None
         for var, coef in self.terms.items():
             if col_bounds is None:
-                lp = var.highs.getLp()
+                lp = self.model.getLp()
                 col_bounds = [
                     (float(l), float(u)) for l, u in zip(lp.col_lower_, lp.col_upper_)
                 ]
