@@ -26,15 +26,26 @@ _SKIP_LAYERS = {"InputLayer", "Input", "Flatten", "Dropout", "Reshape"}
 def _keras_layer_specs(model):
     """Extract (W, b, activation) triples from a Keras model's layers."""
     specs = []
-    pending_activation: Optional[str] = None
     for layer in model.layers:
         lname = type(layer).__name__
         if lname in _SKIP_LAYERS:
             continue
         if lname == "Activation":
-            if pending_activation is not None:
-                raise ValueError("Two consecutive Activation layers are not supported.")
-            pending_activation = layer.activation.__name__
+            # Keras applies a standalone Activation to the output of the
+            # previous layer, so fold it into the preceding Dense's spec.
+            if not specs:
+                raise ValueError(
+                    "An Activation layer before the first Dense layer is "
+                    "not supported."
+                )
+            W, b, prev_act = specs[-1]
+            if prev_act != "linear":
+                raise ValueError(
+                    "Activation layer follows a layer that already has a "
+                    f"non-linear activation ({prev_act!r}); double "
+                    "activations are not supported."
+                )
+            specs[-1] = (W, b, normalize_activation(layer.activation.__name__))
             continue
         if lname != "Dense":
             raise ValueError(
@@ -45,11 +56,7 @@ def _keras_layer_specs(model):
         W = np.asarray(weights[0], dtype=float)
         b = (np.asarray(weights[1], dtype=float) if layer.use_bias
              else np.zeros(W.shape[1]))
-        act = pending_activation or layer.activation.__name__
-        specs.append((W, b, normalize_activation(act)))
-        pending_activation = None
-    if pending_activation is not None:
-        raise ValueError("A trailing Activation layer is not supported.")
+        specs.append((W, b, normalize_activation(layer.activation.__name__)))
     if not specs:
         raise ValueError("Keras model contains no Dense layers.")
     return specs
