@@ -124,11 +124,15 @@ def add_predictor_constr(
             GradientBoostingRegressorConstr,
             RandomForestRegressorConstr,
         )
-        cls = {
-            DecisionTreeRegressor: DecisionTreeRegressorConstr,
-            RandomForestRegressor: RandomForestRegressorConstr,
-            GradientBoostingRegressor: GradientBoostingRegressorConstr,
-        }[type(predictor)]
+        # isinstance (not exact type) so subclasses like ExtraTreeRegressor
+        # dispatch to the base embedding; the three bases are disjoint.
+        cls = next(
+            constr for base, constr in (
+                (DecisionTreeRegressor, DecisionTreeRegressorConstr),
+                (RandomForestRegressor, RandomForestRegressorConstr),
+                (GradientBoostingRegressor, GradientBoostingRegressorConstr),
+            ) if isinstance(predictor, base)
+        )
         return cls(
             highs_model, predictor, input_vars, output_var=output_var,
             stats=stats, name=label,

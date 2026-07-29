@@ -338,11 +338,16 @@ class PipelineConstr(AbstractPredictorConstr):
                     GradientBoostingRegressorConstr,
                     RandomForestRegressorConstr,
                 )
-                cls = {
-                    DecisionTreeRegressor: DecisionTreeRegressorConstr,
-                    RandomForestRegressor: RandomForestRegressorConstr,
-                    GradientBoostingRegressor: GradientBoostingRegressorConstr,
-                }[type(step)]
+                # isinstance (not exact type) so subclasses like
+                # ExtraTreeRegressor dispatch to the base embedding.
+                cls = next(
+                    constr for base, constr in (
+                        (DecisionTreeRegressor, DecisionTreeRegressorConstr),
+                        (RandomForestRegressor, RandomForestRegressorConstr),
+                        (GradientBoostingRegressor,
+                         GradientBoostingRegressorConstr),
+                    ) if isinstance(step, base)
+                )
                 self._final = cls(
                     h, step, exprs, output_var=output_var,
                     stats=self.stats, name=f"{name}_{step_name}")
