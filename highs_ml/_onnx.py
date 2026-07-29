@@ -41,18 +41,30 @@ class ONNXNetworkConstr(AbstractPredictorConstr):
         graph = model_proto.graph
         initializers = {init.name: numpy_helper.to_array(init)
                         for init in graph.initializer}
-        input_names = [i.name for i in graph.input
-                       if i.name not in initializers]
-        if len(input_names) != 1:
+        graph_inputs = [i for i in graph.input
+                        if i.name not in initializers]
+        if len(graph_inputs) != 1:
             raise ValueError("Only single-input ONNX graphs are supported.")
         if len(graph.output) != 1:
             raise ValueError("Only single-output ONNX graphs are supported.")
 
         inputs = [Affine.coerce(v) for v in input_vars]
+        # Validate against the declared input tensor's feature count: the
+        # product of all non-batch dims (dims after the leading batch dim
+        # when rank >= 2, so e.g. (N, 4, 3) feeding Flatten expects 12).
+        # Skipped when any feature dim is symbolic/unset.
+        dims = graph_inputs[0].type.tensor_type.shape.dim
+        feat_dims = dims[1:] if len(dims) > 1 else dims
+        if feat_dims and all(d.HasField("dim_value") and d.dim_value > 0
+                             for d in feat_dims):
+            n_in = math.prod(int(d.dim_value) for d in feat_dims)
+            if len(inputs) != n_in:
+                raise ValueError(
+                    f"Expected {n_in} inputs, got {len(inputs)}.")
         super().__init__(h, model_proto, inputs, stats)
 
         tensors: dict[str, Tensor] = dict(initializers)
-        tensors[input_names[0]] = inputs
+        tensors[graph_inputs[0].name] = inputs
 
         for node in graph.node:
             tensors[node.output[0]] = self._apply_node(
@@ -88,23 +100,37 @@ class ONNXNetworkConstr(AbstractPredictorConstr):
 
         if op == "Gemm":
             A, B = get(node.input[0]), get(node.input[1])
-            if isinstance(A, np.ndarray) == isinstance(B, np.ndarray):
+            const_first = isinstance(A, np.ndarray)
+            if const_first == isinstance(B, np.ndarray):
                 raise ValueError("Gemm requires exactly one constant operand.")
-            if isinstance(A, np.ndarray):
-                A, B = B, A  # ensure A is the affine vector
             alpha = float(attrs["alpha"].f) if "alpha" in attrs else 1.0
             beta = float(attrs["beta"].f) if "beta" in attrs else 1.0
-            Bm = B.T if "transB" in attrs and attrs["transB"].i else B
+            trans_a = bool("transA" in attrs and attrs["transA"].i)
+            trans_b = bool("transB" in attrs and attrs["transB"].i)
+            # The variable operand is a 1-D vector whose transpose is a
+            # numeric no-op (as in _eval_node); only the constant matrix
+            # is transposed, via its own attribute (transA if it is
+            # operand A, transB if operand B). Orient M so that
+            # out_k = beta*C_k + alpha * sum_i M[k, i] * x_i.
+            if const_first:
+                W = A.T if trans_a else A            # out = alpha * W @ x
+                M = W.reshape(1, -1) if W.ndim == 1 else W
+                x = B
+            else:
+                W = B.T if trans_b else B            # out = alpha * x @ W
+                M = (W.reshape(-1, 1) if W.ndim == 1 else W).T
+                x = A
             C = (get(node.input[2]) if len(node.input) > 2
-                 else np.zeros(Bm.shape[1]))
+                 else np.zeros(M.shape[0]))
+            Cflat = np.atleast_1d(np.asarray(C, dtype=float)).ravel()
             out = []
-            for j in range(Bm.shape[1]):
-                z = Affine(const=beta * float(np.atleast_1d(C)[j]
-                                           if np.ndim(C) else C))
-                for i, x in enumerate(A):
-                    coef = alpha * float(Bm[i, j])
+            for k in range(M.shape[0]):
+                z = Affine(const=beta * float(Cflat[k] if Cflat.size > 1
+                                              else Cflat[0]))
+                for i, xi in enumerate(x):
+                    coef = alpha * float(M[k, i])
                     if coef != 0.0:
-                        z = z + x * coef
+                        z = z + xi * coef
                 out.append(z)
             return out
 
