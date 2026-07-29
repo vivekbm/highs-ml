@@ -186,27 +186,32 @@ class RefinablePWL:
 def solve_adaptive(h, embeddings, max_refines: int = 60) -> tuple:
     """Solve, check every embedding's certificate, refine, repeat.
 
-    Round-robin over all embeddings in the model. Returns
+    Round-robin over all embeddings in the model; converged only when
+    every embedding satisfies its OWN tolerance. Returns
     (status, max_certificate_error, total_refinements).
     """
     total_ref = 0
+    worst = 0.0
     for _round in range(max_refines + 1):
         h.run()
         status = h.getModelStatus()
         if status != HighsModelStatus.kOptimal:
             return status, float("nan"), total_ref
-        worst, worst_emb, worst_pt = -1.0, None, None
+        values = h.getSolution().col_value
+        worst = 0.0
+        worst_viol, worst_emb, worst_pt = 0.0, None, None
         for emb in embeddings:
             err = emb.solution_error()
-            if err > worst:
-                values = h.getSolution().col_value
-                worst = err
+            worst = max(worst, err)
+            viol = err - emb.tol  # violation of this embedding's own tol
+            if viol > worst_viol:
+                worst_viol = viol
                 worst_emb = emb
                 worst_pt = (emb.z_aff.evaluate(values)
                             if hasattr(emb, "z_aff")
                             else float(values[emb.x1.index]))
-        if worst_emb is None or worst <= max(e.tol for e in embeddings):
-            return status, worst if worst >= 0 else 0.0, total_ref
+        if worst_emb is None:
+            return status, worst, total_ref
         if not worst_emb.refine(worst_pt):
             # cannot refine further (point at a boundary): report honestly
             return status, worst, total_ref

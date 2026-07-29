@@ -208,8 +208,12 @@ class PiecewiseBilinear:
                             name=f"{name}_x2_{s}")
         _mccormick_binary(h, x2s, delta, self.x2, self.lo2, self.hi2,
                           f"{name}_x2mc{s}", stats)
-        yv = h.addVariable(name=f"{name}_y_{s}")
         lo2, hi2 = self.lo2, self.hi2
+        # corner products bound the segment envelope; 0 must stay inside
+        # the bounds because inactive segments force yv = 0
+        corners = (ls * lo2, ls * hi2, hs * lo2, hs * hi2)
+        yv = h.addVariable(lb=min(0.0, *corners), ub=max(0.0, *corners),
+                           name=f"{name}_y_{s}")
         h.addConstr(yv >= ls * x2s + lo2 * xs - ls * lo2 * delta,
                     name=f"{name}_pm1_{s}")
         h.addConstr(yv >= hs * x2s + hi2 * xs - hs * hi2 * delta,
@@ -345,6 +349,13 @@ def _piecewise_mccormick(h, y, x1, lo1, hi1, x2, lo2, hi2, tol,
         return None
     seg_w = 4.0 * tol / width2
     n_seg = max(1, math.ceil((hi1 - lo1) / seg_w))
+    if n_seg > 1024:
+        raise ValueError(
+            f"piecewise McCormick for {name!r} needs {n_seg} segments "
+            f"(> 1024) at tol={tol} with x1 in [{lo1}, {hi1}] and "
+            f"x2 in [{lo2}, {hi2}]. Tighten the variable bounds or "
+            "loosen the tolerance (tol / pwl_tol)."
+        )
     emb = PiecewiseBilinear(h, y, x1, lo1, hi1, x2, lo2, hi2, tol,
                             name, stats, n_initial=n_seg)
     return emb
