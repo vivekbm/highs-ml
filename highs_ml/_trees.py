@@ -101,26 +101,30 @@ def embed_tree(
         for feat, thr, went_left in path:
             lo, hi = bounds[feat]
             x = inputs[feat]
-            # Effective routing threshold under each convention.
-            if went_left:
-                t_eff = thr if split_style == "sklearn" else thr - epsilon
-                violates_if = lambda v, t=t_eff: v > t
-            else:
-                t_eff = thr + epsilon if split_style == "sklearn" else thr
-                violates_if = lambda v, t=t_eff: v < t
             if x.is_constant():
-                # Fixed feature: the routing decision is decidable now.
-                if violates_if(x.const):
+                # Fixed feature: the routing decision is decidable now,
+                # using the exact split semantics (no epsilon shift, which
+                # would misroute values inside the epsilon sliver).
+                v = x.const
+                if split_style == "sklearn":  # v <= thr goes left
+                    violated = v > thr if went_left else v <= thr
+                else:  # xgboost: v < thr goes left
+                    violated = v >= thr if went_left else v < thr
+                if violated:
                     h.addConstr(lam[l] <= 0.0, name=f"{name}_l{l}_f{feat}_fix")
                     n_constrs += 1
                 continue
+            # Effective routing threshold under each convention; epsilon
+            # models the strict side of the split in the big-M constraints.
             if went_left:
+                t_eff = thr if split_style == "sklearn" else thr - epsilon
                 m = hi - t_eff  # x <= t_eff enforced when lam_l = 1
                 if m <= _SNAP:
                     continue  # holds on the whole reachable interval
                 h.addConstr(x.to_highspy() + m * lam[l] <= hi,
                             name=f"{name}_l{l}_f{feat}_le")
             else:
+                t_eff = thr + epsilon if split_style == "sklearn" else thr
                 m = lo - t_eff  # x >= t_eff enforced when lam_l = 1
                 if m >= -_SNAP:
                     continue  # holds on the whole reachable interval
@@ -192,6 +196,8 @@ class DecisionTreeRegressorConstr(_TreeEnsembleConstr):
     """Exact embedding of ``sklearn.tree.DecisionTreeRegressor``."""
 
     def _ensemble_terms(self):
+        if self.predictor.n_outputs_ != 1:
+            raise ValueError("Multi-output decision trees are not supported yet.")
         return [(self.predictor, 1.0)]
 
 
@@ -199,6 +205,8 @@ class RandomForestRegressorConstr(_TreeEnsembleConstr):
     """Exact embedding of ``sklearn.ensemble.RandomForestRegressor``."""
 
     def _ensemble_terms(self):
+        if self.predictor.n_outputs_ != 1:
+            raise ValueError("Multi-output random forests are not supported yet.")
         trees = self.predictor.estimators_
         return [(tree, 1.0 / len(trees)) for tree in trees]
 
