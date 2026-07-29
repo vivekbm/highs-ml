@@ -37,15 +37,19 @@ def adaptive_breakpoints(
     lo: float,
     hi: float,
     tol: float,
-    max_points: int = 64,
+    max_points: int = 1024,
     samples: int = 33,
 ) -> np.ndarray:
     """Breakpoints of a PWL interpolant of ``f`` on ``[lo, hi]`` with chord
-    error at most ``tol`` (verified on a dense grid per segment)."""
+    error at most ``tol`` (verified on a dense grid per segment).
+
+    Raises ``ValueError`` if ``tol`` cannot be met within ``max_points``
+    breakpoints, so a returned array is always a genuine certificate.
+    """
     points: List[float] = [float(lo), float(hi)]
     fvals = {float(lo): f(float(lo)), float(hi): f(float(hi))}
 
-    while len(points) < max_points:
+    while True:
         worst_err, worst_x = -1.0, None
         for a, b in zip(points[:-1], points[1:]):
             xs = np.linspace(a, b, samples)
@@ -57,6 +61,12 @@ def adaptive_breakpoints(
                 worst_err, worst_x = float(errs[i]), float(xs[i])
         if worst_err <= tol or worst_x is None:
             break
+        if len(points) >= max_points:
+            raise ValueError(
+                f"PWL interpolation on [{lo:g}, {hi:g}] reached "
+                f"max_points={max_points} with chord error {worst_err:.3g} "
+                f"> tol={tol:.3g}; loosen pwl_tol or raise max_points."
+            )
         points.append(worst_x)
         fvals[worst_x] = f(worst_x)
         points.sort()
@@ -92,26 +102,33 @@ def add_pwl_constr(
     tol: float = 0.01,
     name: str = "pwl",
     stats: Optional[PWLStats] = None,
+    max_points: int = 1024,
 ):
     """Add ``y = f(z)`` to HiGHS model ``h`` as a PWL MILP formulation.
 
     ``z`` is an :class:`Affine` form; ``y`` is an existing ``highs_var`` or
     ``None`` (a fresh output variable is created). Returns the output
-    variable, or the constant value of ``f`` when ``z`` is fixed.
+    variable; when ``z`` is fixed the variable is bound to the exact
+    value of ``f``.
     """
     zlo, zhi = z.bounds()
 
     # Degenerate case: the input is fixed — evaluate the function exactly.
     if zhi - zlo < 1e-9:
         value = float(f(zlo))
-        if y is not None:
-            h.addConstr(y == value, name=f"{name}_fixed")
+        if y is None:
+            # Callers rely on receiving a real variable (linkable, indexable),
+            # so fix a fresh one to the value rather than return a raw float.
+            y = h.addVariable(lb=value, ub=value, name=f"{name}_out")
             if stats:
-                stats.n_constrs += 1
+                stats.n_vars += 1
             return y
-        return value
+        h.addConstr(y == value, name=f"{name}_fixed")
+        if stats:
+            stats.n_constrs += 1
+        return y
 
-    breaks = adaptive_breakpoints(f, zlo, zhi, tol)
+    breaks = adaptive_breakpoints(f, zlo, zhi, tol, max_points=max_points)
     fvals = np.array([f(float(x)) for x in breaks])
     n_seg = len(breaks) - 1
 
