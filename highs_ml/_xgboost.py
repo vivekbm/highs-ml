@@ -19,7 +19,11 @@ Notes and limitations
   a probe point and subtract the sum of leaf values from our own tree
   traversal. A self-check on random points validates the round-trip at
   embedding time and raises if the parsed model disagrees with the booster.
-* Multiclass objectives are not supported.
+* Only identity-link regression objectives and the sigmoid-link
+  ``binary:logistic``/``reg:logistic`` are supported; objectives with
+  other links (multiclass, Poisson, gamma, tweedie, ...) raise.
+* Models trained with early stopping are embedded with only the trees up
+  to ``best_iteration``, matching sklearn ``predict``.
 """
 
 from __future__ import annotations
@@ -48,6 +52,25 @@ def _as_booster(model):
 def _objective_name(booster) -> str:
     cfg = json.loads(booster.save_config())
     return cfg["learner"]["objective"]["name"]
+
+
+# Objectives whose .predict output the embedding reproduces exactly:
+# identity-link regression margins, plus the sigmoid link handled by the
+# certified PWL path. Everything else (count:poisson, reg:gamma,
+# reg:tweedie, survival:*, rank:*, binary:logitraw, ...) applies a link
+# the embedding does not model, so it must be rejected.
+_SUPPORTED_OBJECTIVES = frozenset({
+    "reg:squarederror", "reg:linear", "reg:absoluteerror",
+    "reg:pseudohubererror", "binary:logistic", "reg:logistic",
+})
+
+
+def _dmatrix(booster, arr: np.ndarray):
+    """DMatrix carrying the booster's feature names (required when the
+    model was fitted on a DataFrame, harmless otherwise)."""
+    import xgboost as xgb
+
+    return xgb.DMatrix(arr, feature_names=booster.feature_names)
 
 
 def _feature_index_map(booster) -> dict[str, int]:
@@ -105,15 +128,21 @@ class XGBoostConstr(AbstractPredictorConstr):
     def __init__(self, h, model, input_vars, output_var=None,
                  output_type: str = "probability_1", pwl_tol: float = 0.01,
                  stats: Optional[PWLStats] = None, name: str = "xgb"):
-        import xgboost as xgb
-
         self._sklearn_model = model if hasattr(model, "get_booster") else None
         booster = _as_booster(model)
+        # Honor early stopping: sklearn predict uses only trees up to
+        # best_iteration, so slice the booster accordingly and use the
+        # slice for parsing and exact prediction alike.
+        best_it = getattr(booster, "best_iteration", None)
+        if best_it is not None and int(best_it) + 1 < booster.num_boosted_rounds():
+            booster = booster[: int(best_it) + 1]
         self.booster = booster
         objective = _objective_name(booster)
-        is_classifier = objective.startswith("binary:") or objective == "reg:logistic"
         if objective.startswith("multi:"):
             raise ValueError("Multiclass XGBoost objectives are not supported.")
+        if objective not in _SUPPORTED_OBJECTIVES:
+            raise ValueError(f"Unsupported XGBoost objective {objective!r}.")
+        is_classifier = objective in ("binary:logistic", "reg:logistic")
         if output_type not in ("probability_1", "raw"):
             raise ValueError("output_type must be 'probability_1' or 'raw'.")
         self.output_type = "raw" if not is_classifier else output_type
@@ -146,13 +175,15 @@ class XGBoostConstr(AbstractPredictorConstr):
         # Recover the additive constant empirically and self-check the parse.
         probe = np.zeros((1, n_features))
         margin0 = float(
-            booster.predict(xgb.DMatrix(probe), output_margin=True)[0]
+            booster.predict(_dmatrix(booster, probe), output_margin=True)[0]
         )
         constant = margin0 - _eval_margin_from_paths(all_paths, probe[0])
         rng = np.random.default_rng(0)
         for trial in range(3):
             pt = rng.normal(size=(1, n_features))
-            ref = float(booster.predict(xgb.DMatrix(pt), output_margin=True)[0])
+            ref = float(
+                booster.predict(_dmatrix(booster, pt), output_margin=True)[0]
+            )
             mine = constant + _eval_margin_from_paths(all_paths, pt[0])
             if abs(ref - mine) > 1e-6:
                 raise RuntimeError(
@@ -189,9 +220,7 @@ class XGBoostConstr(AbstractPredictorConstr):
         self._is_classifier = is_classifier
 
     def _exact_prediction(self, x: np.ndarray) -> float:
-        import xgboost as xgb
-
-        dm = xgb.DMatrix(x.reshape(1, -1))
+        dm = _dmatrix(self.booster, x.reshape(1, -1))
         if self._is_classifier and self.output_type == "probability_1":
             return float(self.booster.predict(dm)[0])
         return float(self.booster.predict(dm, output_margin=True)[0])
