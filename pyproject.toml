@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "highs-ml"
+version = "1.0.0"
+description = "Embed trained machine-learning models into HiGHS optimization models (Gurobi Machine Learning-style capabilities for the open-source HiGHS solver)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "highs_ml contributors" },
+]
+keywords = [
+    "optimization", "MILP", "HiGHS", "machine-learning", "surrogate",
+    "dantzig-wolfe", "column-generation", "bilinear", "scikit-learn",
+    "xgboost", "lightgbm", "keras", "onnx",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "highspy>=1.10",
+    "scikit-learn>=1.0",
+    "numpy>=1.21",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+xgboost = ["xgboost>=1.6"]
+lightgbm = ["lightgbm>=3.0"]
+keras = ["keras>=3.0"]
+onnx = ["onnx>=1.12"]
+all-predictors = ["xgboost>=1.6", "lightgbm>=3.0", "keras>=3.0", "onnx>=1.12"]
+examples = ["pandas", "xgboost>=1.6"]
+test = ["pandas", "pytest", "xgboost>=1.6", "lightgbm>=3.0", "keras>=3.0", "jax", "onnx>=1.12"]
+benchmark = ["gurobipy", "gurobi-machinelearning"]
+
+[project.urls]
+Homepage = "https://github.com/vivekbm/highs-ml"
+Repository = "https://github.com/vivekbm/highs-ml"
+Issues = "https://github.com/vivekbm/highs-ml/issues"
+HiGHS = "https://github.com/ERGO-Code/HiGHS"
+
+[tool.setuptools.packages.find]
+include = ["highs_ml*"]
