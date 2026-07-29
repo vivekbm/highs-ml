@@ -3,10 +3,16 @@
 import math
 import pathlib
 import sys
+import unittest
 
 import numpy as np
 import pandas as pd
 import highspy
+
+try:  # pytest is optional: the file is also runnable directly.
+    import pytest
+except ImportError:
+    pytest = None
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.neural_network import MLPRegressor
@@ -25,6 +31,18 @@ def _quiet_highs():
     h = highspy.Highs()
     h.setOptionValue("output_flag", False)
     return h
+
+
+def _optional_import(name):
+    """Import an optional dependency; skip the test if it is missing."""
+    if pytest is not None:
+        return pytest.importorskip(name)
+    try:
+        return __import__(name)
+    except ImportError as exc:
+        # Raise a distinct skip exception so the __main__ loop only skips on
+        # missing optional deps, not on any ImportError inside a test body.
+        raise unittest.SkipTest(f"{name} not available: {exc}") from exc
 
 
 def test_linear_regression_is_exact():
@@ -219,7 +237,7 @@ def test_tree_optimization_direction():
 
 
 def test_xgboost_regressor_exact():
-    xgb = pytest.importorskip("xgboost") if "pytest" in sys.modules else __import__("xgboost")
+    xgb = _optional_import("xgboost")
     X = RNG.uniform(-4, 4, size=(500, 2))
     yv = np.sin(X[:, 0]) + 0.5 * X[:, 1] ** 2
     model = xgb.XGBRegressor(n_estimators=15, max_depth=4,
@@ -244,7 +262,7 @@ def test_xgboost_regressor_exact():
 
 
 def test_xgboost_classifier_probability():
-    xgb = pytest.importorskip("xgboost") if "pytest" in sys.modules else __import__("xgboost")
+    xgb = _optional_import("xgboost")
     X = RNG.uniform(-4, 4, size=(600, 2))
     yv = (X[:, 0] + X[:, 1] ** 2 > 1.0).astype(int)
     model = xgb.XGBClassifier(n_estimators=15, max_depth=4,
@@ -291,7 +309,7 @@ def test_pls_regression_exact():
 
 
 def test_lightgbm_regressor_exact():
-    lgb = __import__("lightgbm")
+    lgb = _optional_import("lightgbm")
     X = RNG.uniform(-4, 4, size=(500, 2))
     yv = np.sin(X[:, 0]) + 0.5 * X[:, 1] ** 2
     model = lgb.LGBMRegressor(n_estimators=15, max_depth=4, verbose=-1,
@@ -315,7 +333,7 @@ def test_lightgbm_regressor_exact():
 
 
 def test_lightgbm_classifier_probability():
-    lgb = __import__("lightgbm")
+    lgb = _optional_import("lightgbm")
     X = RNG.uniform(-4, 4, size=(600, 2))
     yv = (X[:, 0] + X[:, 1] ** 2 > 1.0).astype(int)
     model = lgb.LGBMClassifier(n_estimators=15, max_depth=4, verbose=-1,
@@ -342,7 +360,7 @@ def test_lightgbm_classifier_probability():
 def test_keras_dense_network():
     import os
     os.environ.setdefault("KERAS_BACKEND", "jax")
-    keras = __import__("keras")
+    keras = _optional_import("keras")
 
     X = RNG.uniform(-3, 3, size=(400, 2))
     yv = np.maximum(0, X[:, 0]) - 2 * np.maximum(0, -X[:, 1]) + 0.5
@@ -373,7 +391,7 @@ def test_keras_dense_network():
 
 
 def test_onnx_network():
-    onnx = __import__("onnx")
+    onnx = _optional_import("onnx")
     from onnx import helper, numpy_helper
 
     rng = np.random.default_rng(7)
@@ -468,22 +486,32 @@ def test_polynomial_features_degree2_two_variables_embeds():
 
 
 if __name__ == "__main__":
-    test_linear_regression_is_exact()
-    test_logistic_regression_pwl()
-    test_mlp_regressor_relu_exact()
-    test_pipeline_with_scaler()
-    test_student_enrollment_objective()
-    test_decision_tree_exact()
-    test_random_forest_exact()
-    test_gradient_boosting_exact()
-    test_tree_optimization_direction()
-    test_xgboost_regressor_exact()
-    test_xgboost_classifier_probability()
-    test_pls_regression_exact()
-    test_lightgbm_regressor_exact()
-    test_lightgbm_classifier_probability()
-    test_keras_dense_network()
-    test_onnx_network()
-    test_column_transformer_and_poly_on_fixed_features()
-    test_polynomial_features_degree2_two_variables_embeds()
+    # _optional_import raises unittest.SkipTest (no pytest) or pytest's
+    # Skipped (a BaseException) outside a pytest run; treat only those as
+    # skips so a genuine ImportError inside a test body still fails.
+    _skip_excs = (unittest.SkipTest,) if pytest is None else (unittest.SkipTest, pytest.skip.Exception)
+    for _test in [
+        test_linear_regression_is_exact,
+        test_logistic_regression_pwl,
+        test_mlp_regressor_relu_exact,
+        test_pipeline_with_scaler,
+        test_student_enrollment_objective,
+        test_decision_tree_exact,
+        test_random_forest_exact,
+        test_gradient_boosting_exact,
+        test_tree_optimization_direction,
+        test_xgboost_regressor_exact,
+        test_xgboost_classifier_probability,
+        test_pls_regression_exact,
+        test_lightgbm_regressor_exact,
+        test_lightgbm_classifier_probability,
+        test_keras_dense_network,
+        test_onnx_network,
+        test_column_transformer_and_poly_on_fixed_features,
+        test_polynomial_features_degree2_two_variables_embeds,
+    ]:
+        try:
+            _test()
+        except _skip_excs as exc:
+            print(f"skip {_test.__name__}: {exc}")
     print("\nAll highs_ml tests passed.")
