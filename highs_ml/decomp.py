@@ -220,12 +220,19 @@ def solve_decomposed(h: highspy.Highs, max_class_solves: int = 1000,
                      verify: bool = True) -> DecompResult:
     """Solve a HiGHS model via block decomposition when profitable.
 
-    Falls back to a direct solve for single-component models. Never
-    changes ``h``; returns a :class:`DecompResult` with the global
-    solution.
+    Falls back to a direct solve for single-component models and for
+    quadratic objectives. Never changes the *model* in ``h``; on success
+    the stitched solution is installed into ``h`` (via ``setSolution``)
+    so ``h.getSolution()`` is valid. Returns a :class:`DecompResult`
+    with the global solution.
     """
     t0 = time.perf_counter()
     timings: dict[str, float] = {}
+    if h.getHessianNumNz() > 0:
+        # Block solves and verification are linear-only; decomposing
+        # would silently drop the quadratic objective.
+        return _direct_solve(h, timings, 0, 0,
+                             "quadratic objective: solved directly")
     lp = h.getLp()
     sense_min = (getattr(lp, "sense_", highspy.ObjSense.kMinimize)
                  == highspy.ObjSense.kMinimize)
@@ -302,6 +309,12 @@ def solve_decomposed(h: highspy.Highs, max_class_solves: int = 1000,
                 note=f"verification failed, refusing result: {msg}",
                 timings=timings)
         result.note += "; stitched solution verified numerically"
+    if result.col_value is not None:
+        # Install the stitched solution so h.getSolution() is valid and
+        # downstream consumers (e.g. predictor-constraint get_error) work.
+        stitched = highspy.HighsSolution()
+        stitched.col_value = result.col_value
+        h.setSolution(stitched)
     return result
 
 
