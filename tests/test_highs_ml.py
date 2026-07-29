@@ -34,12 +34,20 @@ def _quiet_highs():
 
 
 def _optional_import(name):
-    """Import an optional dependency; skip the test if it is missing."""
+    """Import an optional dependency; skip the test if it is missing.
+
+    Catches OSError too: some wheels (notably LightGBM on macOS without
+    libomp) install fine but fail to load their native library at import
+    time, raising OSError rather than ImportError.
+    """
     if pytest is not None:
-        return pytest.importorskip(name)
+        try:
+            return pytest.importorskip(name)
+        except OSError as exc:
+            pytest.skip(f"{name} not loadable: {exc}")
     try:
         return __import__(name)
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         # Raise a distinct skip exception so the __main__ loop only skips on
         # missing optional deps, not on any ImportError inside a test body.
         raise unittest.SkipTest(f"{name} not available: {exc}") from exc
