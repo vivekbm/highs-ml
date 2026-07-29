@@ -86,7 +86,11 @@ def _build_submodel(st, x_inc: np.ndarray, free_cols: np.ndarray):
 def _lns_improve(st, x_inc: np.ndarray, obj_inc: float, rounds: int = 12,
                  k_neighborhood: int = 6, seed: int = 0,
                  time_budget: float = 60.0):
-    """LNS over block neighborhoods. obj_inc in *original* sense.
+    """LNS over block neighborhoods.
+
+    ``obj_inc`` is in the *original* sense with the model offset
+    EXCLUDED (i.e. ``costs @ x_inc``), matching the candidate objectives
+    computed below; the returned ``obj_best`` uses the same convention.
 
     Neighborhoods mix random classes with the classes whose incumbent
     block point differs most from the master-LP fractional mix (the

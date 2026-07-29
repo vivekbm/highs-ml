@@ -18,9 +18,10 @@ branch-and-price):
 2. **Column generation** on the LP master:
        max/min over lambda s.t. convexity + coupling rows
    with per-block MIP pricing problems. Blocks that are structurally
-   identical share one pricing problem per iteration. Dual signs are
-   *self-calibrated* against LP dual-feasibility, so no solver-specific
-   sign convention is assumed.
+   identical (including their coupling-row coefficients) share one
+   pricing problem per iteration. HiGHS's dual convention (verified
+   empirically) is: for a min-form LP the reduced cost of a column is
+   ``cost - row_dual @ a_col``, with ``row_dual`` used as returned.
 3. **Restricted-master heuristic**: solve the final master with the
    convexity variables made binary — each block then picks exactly one of
    its generated operating points, yielding a primal-feasible MIP
@@ -425,7 +426,11 @@ def _solve_master(rows_bounds, cols, master_var_specs, binary_lam: bool,
     lp.a_matrix_.index_ = np.array(index, dtype=np.int32)
     lp.a_matrix_.value_ = np.array(value, dtype=float)
     h.passModel(lp)
-    if binary_lam or any(t == highspy.HighsVarType.kInteger for t in ints):
+    # During column generation (binary_lam=False) the master must be a
+    # pure LP: applying integrality (even only to integer linking
+    # columns) turns it into a MIP, whose solution carries no duals and
+    # would silence pricing entirely.
+    if binary_lam:
         h.changeColsIntegrality(n_cols, np.arange(n_cols, dtype=np.int32),
                                 np.array(ints))
     h.run()
@@ -433,31 +438,14 @@ def _solve_master(rows_bounds, cols, master_var_specs, binary_lam: bool,
     if status != highspy.HighsModelStatus.kOptimal:
         return status, 0.0, None, None, None
     sol = h.getSolution()
+    if not binary_lam:
+        assert bool(sol.dual_valid), "master LP solve returned no duals"
     duals = np.array(sol.row_dual)
     values = np.array(sol.col_value)
     lam_vals = {j: values[j] for j, c in enumerate(cols) if c["kind"] == "lambda"}
     var_vals = {cols[j]["var_index"]: values[j]
                 for j, c in enumerate(cols) if c["kind"] == "var"}
     return status, h.getObjectiveValue(), duals, lam_vals, var_vals
-
-
-def _calibrate_dual_sign(duals, rows_bounds, cols) -> np.ndarray:
-    """Pick the dual sign consistent with LP dual feasibility.
-
-    For a min LP with x >= 0, reduced costs c_j - pi^T a_j are >= -tol at
-    optimality for every column (max: flip both senses). We test both
-    signs and keep the one that violates less.
-    """
-    def violation(pi):
-        worst = 0.0
-        for col in cols:
-            rc = col["cost"] - sum(pi[r] * v for r, v in col["coeffs"].items())
-            if col["kind"] == "lambda":
-                worst = min(worst, rc)  # lambda >= 0 must have rc >= 0
-        return worst
-    v_pos = violation(duals)
-    v_neg = violation(-duals)
-    return duals if v_pos >= v_neg else -duals
 
 
 # ----------------------------------------------------------------------
@@ -515,6 +503,30 @@ class _DWState:
         classes, comp_col_ids, comp_row_ids_local = _classify_blocks(
             A_sub, lp_sub, col_labels, row_blk[keep],
             self.n_blocks + 1, self.integrality)
+
+        # Blocks identical in their own rows/costs may still differ in
+        # their coupling-row coefficients; the representative's A0 column
+        # is substituted for every class member, so blocks may only share
+        # a class when their A0 columns match too.
+        A0_csc = A[self.coupling].tocsc()
+        a0_ptr, a0_idx = A0_csc.indptr, A0_csc.indices
+        a0_val = np.round(A0_csc.data, 12)
+
+        def _a0_sig(cols_k):
+            parts = []
+            for c in cols_k:
+                b, e = a0_ptr[c], a0_ptr[c + 1]
+                parts.append(np.int64(e - b).tobytes())
+                parts.append(a0_idx[b:e].tobytes())
+                parts.append(a0_val[b:e].tobytes())
+            return b"".join(parts)
+
+        refined: dict = {}
+        for sig, members in classes.items():
+            for k in members:
+                a0k = _a0_sig(comp_col_ids[k]) if k < self.n_blocks else b"m"
+                refined.setdefault((sig, a0k), []).append(k)
+        classes = refined
 
         self.block_cols = comp_col_ids[:self.n_blocks]
         self.block_rows_of = [keep[comp_row_ids_local[k]]
@@ -647,31 +659,42 @@ def _run_cg(st: _DWState, lam_bounds, max_iterations: int, tol: float,
     ``blk_bounds`` (class -> {block col -> (lo, hi)}) tightens the pricing
     subproblems at this node — original-variable branching. Columns found
     inside the branch are globally valid block points.
+
+    The reported ``bound`` is the best Lagrangian dual bound
+    ``z_RMP + sum_cl M_cl * min(0, rc*_cl)`` seen across iterations,
+    which is valid even when CG stops at ``max_iterations`` — the plain
+    restricted-master value is only a dual bound after convergence.
     """
     blk_bounds = blk_bounds or {}
-    bound_min = np.nan
+    best_lb = -np.inf
     lam_vals = None
+    var_vals = None
     cols = None
     artificial_use = 0.0
     iterations = 0
+    converged = False
     t0 = time.perf_counter()
     for it in range(max_iterations):
         iterations = it + 1
         cols = st.assemble_cols(binary=False, lam_bounds=lam_bounds,
                                 blk_bounds=blk_bounds)
-        status, obj, duals, lam_vals, _ = _solve_master(
+        status, obj, duals, lam_vals, var_vals = _solve_master(
             st.rows_bounds, cols, st.master_var_cols, False, True)
         if status != highspy.HighsModelStatus.kOptimal:
             return {"status": status, "bound": np.nan, "cols": cols,
-                    "lam_vals": None, "iterations": iterations,
-                    "artificial_use": np.inf, "time": time.perf_counter() - t0}
-        bound_min = obj
+                    "lam_vals": None, "var_vals": None,
+                    "iterations": iterations, "artificial_use": np.inf,
+                    "converged": False, "time": time.perf_counter() - t0}
         artificial_use = sum(v for j, v in (lam_vals or {}).items()
                              if cols[j].get("class") == -1)
-        pi = _calibrate_dual_sign(duals, st.rows_bounds, cols)
+        # HiGHS convention (verified empirically): min-form reduced cost
+        # is cost - row_dual @ a_col, duals used exactly as returned.
+        pi = duals
         pi_c, sigma = pi[:st.n_coupling], pi[st.n_coupling:]
 
         added = 0
+        lagr = obj  # z_RMP; corrected below by pricing reduced costs
+        lagr_valid = True
         for cl in range(st.n_classes):
             sub = st.class_subs[cl]
             price_cost = sub["col_cost"] - pi_c @ st.class_A0[cl]
@@ -687,11 +710,24 @@ def _run_cg(st: _DWState, lam_bounds, max_iterations: int, tol: float,
                 sub2["col_lower"] = lo
                 sub2["col_upper"] = hi
             hp = _pass_lp(sub2, True)
+            if any(int(t) != 0 for t in sub["integrality"]):
+                # exact pricing: the Lagrangian bound needs the true
+                # pricing optimum, not an incumbent at MIP gap tolerance
+                hp.setOptionValue("mip_rel_gap", 0.0)
+                hp.setOptionValue("mip_abs_gap", 0.0)
             hp.run()
             if hp.getModelStatus() != highspy.HighsModelStatus.kOptimal:
+                lagr_valid = False
                 continue
+            pobj = hp.getObjectiveValue()
+            pobj_lb = pobj  # certified lower bound on the pricing optimum
+            if any(int(t) != 0 for t in sub["integrality"]):
+                db = float(hp.getInfo().mip_dual_bound)
+                if np.isfinite(db):
+                    pobj_lb = min(pobj, db)
             x_new = np.array(hp.getSolution().col_value)
-            rc = hp.getObjectiveValue() - sigma[cl]
+            rc = pobj - sigma[cl]
+            lagr += len(st.class_members[cl]) * min(0.0, pobj_lb - sigma[cl])
             if rc < -tol:
                 st.class_columns[cl].append({
                     "x": x_new,
@@ -699,11 +735,15 @@ def _run_cg(st: _DWState, lam_bounds, max_iterations: int, tol: float,
                     "cost": float(sub["col_cost"] @ x_new),
                 })
                 added += 1
+        if lagr_valid:
+            best_lb = max(best_lb, lagr)
         if added == 0:
+            converged = True
             break
-    return {"status": highspy.HighsModelStatus.kOptimal, "bound": bound_min,
-            "cols": cols, "lam_vals": lam_vals, "iterations": iterations,
-            "artificial_use": artificial_use, "time": time.perf_counter() - t0}
+    return {"status": highspy.HighsModelStatus.kOptimal, "bound": best_lb,
+            "cols": cols, "lam_vals": lam_vals, "var_vals": var_vals,
+            "iterations": iterations, "artificial_use": artificial_use,
+            "converged": converged, "time": time.perf_counter() - t0}
 
 
 def _restricted_master(st: _DWState, lam_bounds, blk_bounds=None):
@@ -713,8 +753,13 @@ def _restricted_master(st: _DWState, lam_bounds, blk_bounds=None):
                             blk_bounds=blk_bounds)
     status, obj, _, lam_vals, var_vals = _solve_master(
         st.rows_bounds, cols, st.master_var_cols, True, True)
+    # _recover silently drops artificial columns, so a solution leaning
+    # on them is coupling-infeasible: callers must reject it.
+    artificial_use = sum(v for j, v in (lam_vals or {}).items()
+                         if cols[j].get("class") == -1)
     return {"status": status, "obj": obj, "cols": cols,
             "lam_vals": lam_vals, "var_vals": var_vals,
+            "artificial_use": artificial_use,
             "time": time.perf_counter() - t0}
 
 
@@ -739,6 +784,35 @@ def _recover(st: _DWState, cols, lam_vals, var_vals) -> np.ndarray:
             for t in range(assigned[cl], len(st.class_members[cl])):
                 k = st.class_members[cl][t]
                 x_full[st.block_cols[k]] = st.class_columns[cl][0]["x"]
+    for j, v in (var_vals or {}).items():
+        x_full[j] = v
+    return x_full
+
+
+def _recover_fractional(st: _DWState, cols, lam_vals, var_vals) -> np.ndarray:
+    """Primal solution from a *fractional* master LP (continuous models).
+
+    Each class member gets the lambda-weighted average of the class's
+    operating points — a convex combination, feasible for continuous
+    blocks — and master columns take their LP values."""
+    x_full = np.zeros(st.lp.num_col_)
+    agg: dict[int, np.ndarray | None] = {cl: None
+                                         for cl in range(st.n_classes)}
+    for j, c in enumerate(cols):
+        if c["kind"] != "lambda" or c.get("class", -1) < 0:
+            continue
+        v = (lam_vals or {}).get(j, 0.0)
+        if v <= 0.0:
+            continue
+        cl, q = c["class"], c["q"]
+        contrib = v * st.class_columns[cl][q]["x"]
+        agg[cl] = contrib if agg[cl] is None else agg[cl] + contrib
+    for cl in range(st.n_classes):
+        count = float(len(st.class_members[cl]))
+        xbar = (agg[cl] / count if agg[cl] is not None
+                else st.class_columns[cl][0]["x"])
+        for k in st.class_members[cl]:
+            x_full[st.block_cols[k]] = xbar
     for j, v in (var_vals or {}).items():
         x_full[j] = v
     return x_full
@@ -823,11 +897,24 @@ def solve_dw(h: highspy.Highs, max_iterations: int = 100,
                         n_unique_classes=st.n_classes, iterations=iterations,
                         decomposed=True, note="restricted master MIP failed",
                         timings=timings)
+    if rm["artificial_use"] > 1e-5:
+        return DWResult(status=highspy.HighsModelStatus.kNotset,
+                        objective=0.0,
+                        bound=float(st.offset + st.sign * cg["bound"]),
+                        col_value=None, n_blocks=st.n_blocks,
+                        n_coupling_rows=st.n_coupling,
+                        n_master_cols=len(st.master_cols),
+                        n_unique_classes=st.n_classes, iterations=iterations,
+                        decomposed=True,
+                        note=("restricted master relied on artificial "
+                              "columns: no coupling-feasible integer "
+                              "combination in the column pool"),
+                        timings=timings)
 
     x_full = _recover(st, rm["cols"], rm["lam_vals"], rm["var_vals"])
-    obj_inc = float(np.asarray(st.lp.col_cost_) @ x_full)  # original costs
-    obj_inc_min = st.sign * (obj_inc - st.offset)  # internal min form
-    # incumbent may beat the restricted-master bound bookkeeping; keep as is
+    # internal min form, model offset excluded (offset is added back only
+    # when populating DWResult fields inside _make_result)
+    obj_inc_min = st.sign * float(np.asarray(st.lp.col_cost_) @ x_full)
     return _make_result(st, x_full, cg["bound"], obj_inc_min, iterations,
                         timings)
 
@@ -869,6 +956,19 @@ def solve_bp(h: highspy.Highs, max_iterations: int = 100,
                         note="model appears infeasible at the root",
                         timings=timings)
 
+    # All-continuous models never branch: the master LP's lambda-weighted
+    # block points are convex combinations of feasible block points and
+    # hence feasible, so the root LP solution is final.
+    if not any(int(t) != 0 for t in st.integrality):
+        x_lp = _recover_fractional(st, cg0["cols"], cg0["lam_vals"],
+                                   cg0["var_vals"])
+        obj_lp = st.sign * float(np.asarray(st.lp.col_cost_) @ x_lp)
+        note = ("continuous model: master LP solution is final"
+                if cg0["converged"] else
+                "continuous model: CG iteration limit reached")
+        return _make_result(st, x_lp, cg0["bound"], obj_lp,
+                            cg0["iterations"], timings, extra_note=note)
+
     rm0 = _restricted_master(st, {})
     timings["root_restricted_master"] = rm0["time"]
     total_iters = cg0["iterations"]
@@ -879,13 +979,16 @@ def solve_bp(h: highspy.Highs, max_iterations: int = 100,
                         col_value=None, note="root restricted master failed",
                         timings=timings)
 
-    x_inc = _recover(st, rm0["cols"], rm0["lam_vals"], rm0["var_vals"])
-    obj_inc = st.sign * float(np.asarray(st.lp.col_cost_) @ x_inc) \
-        - st.sign * st.offset  # internal min form, no offset
-    # (all internal comparisons in min form, offset excluded)
+    # All internal comparisons are in min form with the model offset
+    # excluded; the offset is added back only inside _make_result.
+    x_inc, obj_inc = None, float("inf")
+    if rm0["artificial_use"] <= 1e-5:
+        x_inc = _recover(st, rm0["cols"], rm0["lam_vals"], rm0["var_vals"])
+        obj_inc = st.sign * float(np.asarray(st.lp.col_cost_) @ x_inc)
     bound_root = cg0["bound"]
 
-    if obj_inc - bound_root <= tol * max(1.0, abs(bound_root)):
+    if x_inc is not None and \
+            obj_inc - bound_root <= tol * max(1.0, abs(bound_root)):
         return _make_result(st, x_inc, bound_root, obj_inc, total_iters,
                             timings, extra_note="proven optimal at root")
 
@@ -893,31 +996,39 @@ def solve_bp(h: highspy.Highs, max_iterations: int = 100,
     t0 = time.perf_counter()
     nodes = [{"lam": {}, "blk": {}, "bound": bound_root, "depth": 0}]
     processed = 0
-    best_bound = bound_root
-    proven = False
+    # Valid min-form bounds of finished subtrees (pruned or fully
+    # explored). Infeasible subtrees contribute +inf, i.e. nothing.
+    closed_bounds: list[float] = []
     while nodes and processed < node_budget:
         # best-first: lowest (min-form) bound
         nodes.sort(key=lambda nd: nd["bound"])
         node = nodes.pop(0)
         if node["bound"] >= obj_inc - tol * max(1.0, abs(obj_inc)):
-            continue  # pruned by incumbent
+            closed_bounds.append(node["bound"])
+            continue  # pruned by incumbent (its bound stays valid)
         cg = _run_cg(st, node["lam"], max_iterations, tol,
                      blk_bounds=node["blk"])
         total_iters += cg["iterations"]
         processed += 1
-        if cg["status"] != highspy.HighsModelStatus.kOptimal or \
-                cg["artificial_use"] > 1e-5:
-            continue  # infeasible node
-        nd_bound = cg["bound"]
+        if cg["status"] != highspy.HighsModelStatus.kOptimal:
+            if cg["status"] != highspy.HighsModelStatus.kInfeasible:
+                # unresolved (not proven infeasible): keep its valid bound
+                closed_bounds.append(node["bound"])
+            continue
+        if cg["artificial_use"] > 1e-5:
+            continue  # coupling-infeasible node
+        # parent bound and this node's Lagrangian bound are both valid
+        nd_bound = max(node["bound"], cg["bound"])
         if nd_bound >= obj_inc - tol * max(1.0, abs(obj_inc)):
+            closed_bounds.append(nd_bound)
             continue  # pruned
 
         # try to improve the incumbent at this node
         rm = _restricted_master(st, node["lam"], blk_bounds=node["blk"])
-        if rm["status"] == highspy.HighsModelStatus.kOptimal:
+        if rm["status"] == highspy.HighsModelStatus.kOptimal and \
+                rm["artificial_use"] <= 1e-5:
             x_cand = _recover(st, rm["cols"], rm["lam_vals"], rm["var_vals"])
-            obj_cand = st.sign * float(np.asarray(st.lp.col_cost_) @ x_cand) \
-                - st.sign * st.offset
+            obj_cand = st.sign * float(np.asarray(st.lp.col_cost_) @ x_cand)
             if obj_cand < obj_inc - tol:
                 obj_inc, x_inc = obj_cand, x_cand
 
@@ -940,8 +1051,8 @@ def solve_bp(h: highspy.Highs, max_iterations: int = 100,
             xbar = sum(v * st.class_columns[cl][q]["x"] for q, v in qvs)
             ints = st.class_subs[cl]["integrality"]
             for j in range(len(xbar)):
-                if j < len(ints) and not ints[j]:
-                    continue  # only branch on integer block variables
+                if j >= len(ints) or not ints[j]:
+                    continue  # no integrality info means continuous
                 f = abs(xbar[j] - round(xbar[j]))
                 if f > best_f:
                     best_f = f
@@ -955,12 +1066,20 @@ def solve_bp(h: highspy.Highs, max_iterations: int = 100,
                         branch = ("lam", cl, q, v)
 
         if branch is None:
-            # LP solution is integer here: it is a valid primal candidate
-            x_lp = _recover(st, cg["cols"], cg["lam_vals"], None)
-            obj_lp = st.sign * float(np.asarray(st.lp.col_cost_) @ x_lp) \
-                - st.sign * st.offset
-            if obj_lp < obj_inc - tol:
-                obj_inc, x_inc = obj_lp, x_lp
+            # Lambda-integral LP: a valid primal candidate — including the
+            # master (linking) columns at their LP values, which must be
+            # integral where the original model demands it.
+            var_vals = cg["var_vals"] or {}
+            ints_ok = all(abs(v - round(v)) <= 1e-6
+                          for j, v in var_vals.items()
+                          if (len(st.integrality) == st.lp.num_col_
+                              and st.integrality[j] != 0))
+            if ints_ok:
+                x_lp = _recover(st, cg["cols"], cg["lam_vals"], var_vals)
+                obj_lp = st.sign * float(np.asarray(st.lp.col_cost_) @ x_lp)
+                if obj_lp < obj_inc - tol:
+                    obj_inc, x_inc = obj_lp, x_lp
+            closed_bounds.append(nd_bound)  # node fully resolved
             continue
 
         if branch[0] == "var":
@@ -992,36 +1111,61 @@ def solve_bp(h: highspy.Highs, max_iterations: int = 100,
             nodes.append(lo_b)
             nodes.append(hi_b)
 
-    best_bound = min((nd["bound"] for nd in nodes), default=obj_inc)
-    proven = not nodes
+    # Global bound: min over the valid bounds of open and finished
+    # subtrees. Never the incumbent — that is not a dual bound. The root
+    # Lagrangian bound is always a valid fallback.
+    all_bounds = closed_bounds + [nd["bound"] for nd in nodes]
+    best_bound = min(all_bounds) if all_bounds else bound_root
 
     # Final incumbent attempt with the fully enriched column pool — columns
     # generated inside branches are globally valid, so the last restricted
     # master sees every operating point found anywhere in the tree.
     rm_final = _restricted_master(st, {})
-    if rm_final["status"] == highspy.HighsModelStatus.kOptimal:
+    if rm_final["status"] == highspy.HighsModelStatus.kOptimal and \
+            rm_final["artificial_use"] <= 1e-5:
         x_cand = _recover(st, rm_final["cols"], rm_final["lam_vals"],
                           rm_final["var_vals"])
-        obj_cand = st.sign * float(np.asarray(st.lp.col_cost_) @ x_cand) \
-            - st.sign * st.offset
+        obj_cand = st.sign * float(np.asarray(st.lp.col_cost_) @ x_cand)
         if obj_cand < obj_inc - tol:
             obj_inc, x_inc = obj_cand, x_cand
+
+    if x_inc is None:
+        timings["branch_and_price"] = time.perf_counter() - t0
+        return DWResult(status=highspy.HighsModelStatus.kNotset,
+                        objective=0.0,
+                        bound=float(st.offset + st.sign * best_bound),
+                        col_value=None, n_blocks=st.n_blocks,
+                        n_coupling_rows=st.n_coupling,
+                        n_master_cols=len(st.master_cols),
+                        n_unique_classes=st.n_classes,
+                        iterations=total_iters, decomposed=True,
+                        note=("no feasible incumbent found (restricted "
+                              "masters relied on artificial columns)"),
+                        timings=timings)
 
     # LNS polish: fix most blocks to the incumbent, re-solve small
     # neighborhoods exactly with HiGHS over the original rows.
     if lns_rounds > 0:
         from ._lns import _lns_improve
-        obj_orig = st.offset + st.sign * obj_inc
+        obj_orig = st.sign * obj_inc  # original sense, offset excluded
         x_lns, obj_lns, improved = _lns_improve(
             st, x_inc, obj_orig, rounds=lns_rounds,
             k_neighborhood=lns_neighborhood, time_budget=lns_time_budget)
         if improved:
             x_inc = x_lns
-            obj_inc = st.sign * (obj_lns - st.offset)
+            obj_inc = st.sign * obj_lns
 
     timings["branch_and_price"] = time.perf_counter() - t0
-    note = ("proven optimal by branch-and-price" if proven else
-            f"node budget exhausted ({processed} nodes); returning "
-            "best bound and incumbent")
+    # optimality is claimed only against the valid bound, re-checked
+    # after the rm_final/LNS incumbent improvements
+    proven = obj_inc - best_bound <= tol * max(1.0, abs(best_bound))
+    if proven:
+        note = "proven optimal by branch-and-price"
+    elif nodes:
+        note = (f"node budget exhausted ({processed} nodes); returning "
+                "best bound and incumbent")
+    else:
+        note = (f"search finished without optimality proof ({processed} "
+                "nodes); returning best bound and incumbent")
     return _make_result(st, x_inc, best_bound, obj_inc, total_iters,
                         timings, extra_note=note, nodes=processed)
